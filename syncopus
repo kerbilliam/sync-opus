@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+export PARALLEL_SHELL="$BASH"
+
+# --- Help & Usage ---
+usage() {
+    cat << EOF
+Usage: $0 [-b <bitrate>] [-j <jobs>] [-n] <source_dir> <destination_dir>
+    -b  Bitrate in kbps (default: 128)
+    -j  Number of parallel jobs (default: half of CPU cores)
+    -n  Do not copy embedded picture when reencoding to opus
+Note:
+    Files named 'flac' or 'wav', uppper or lower case, that are not
+    valid flac or wav files, will not be copied.
+EOF
+    exit 0
+}
+
+print_error() {
+    echo "$@" >&2
+}
+
+die() {
+    print_error "$@"
+    exit 1
+}
+
+# check for required, non standard programs
+MISSING_CMD=""
+for cmd in opusenc parallel; do
+    if ! command -v "$cmd" >/dev/null; then
+        MISSING_CMD=1
+        print_error "$cmd not found"
+    fi
+done
+
+[ -n "$MISSING_CMD" ] && die "Please install required programs."
+
+# --- Default Parameters ---
+BITRATE=128
+# Default to half of available CPU cores (minimum 1)
+CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+JOBS=$(( CPU_CORES / 2 ))
+[ "$JOBS" -lt 1 ] && JOBS=1
+
+SOURCE_DIR=""
+DEST_DIR=""
+NO_PICTURES_OPT=""
+
+# Parse options
+while getopts "b:j:nh" opt; do
+    case "${opt}" in
+        b) BITRATE="${OPTARG}" ;;
+        j) JOBS="${OPTARG}" ;;
+        n) NO_PICTURES_OPT="--discard-pictures" ;;
+        h|*) usage ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+# assign directories
+if [ $# -eq 2 ]; then
+    SOURCE_DIR="$1"
+    DEST_DIR="$2"
+else
+    die "Error: Invalid number of arguments after options."
+fi
+
+# check if source dir exists
+if [ -d "$SOURCE_DIR" ]; then
+    SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)" # get absolute path
+else
+    die "Error: '$SOURCE_DIR' is not a directory"
+fi
+
+# ensure existance and get absolute path
+DEST_DIR="$(mkdir -p "$DEST_DIR" && cd "$DEST_DIR" && pwd)"
+
+export SOURCE_DIR DEST_DIR BITRATE NO_PICTURES_OPT
+
+# Create directory layout
+cd "$SOURCE_DIR" && find . -type d -exec mkdir -p "$DEST_DIR/{}" \;
+
+sync_item() {
+    local file="$1"
+
+    # Assumes input comes from 'find .'
+    local rel_path="${file#./}" # Remove ./ from find output
+
+    local ext="${rel_path##*.}"
+    local lc_ext="${ext,,}"
+    
+    # target output paths
+    
+    if [[ "$lc_ext" == "flac" || "$lc_ext" == "wav" ]]; then
+        local target_opus="$DEST_DIR/${rel_path%.*}.opus"
+        # check if file doesn't exist, if it does, check if input is newer
+        if [[ ! -f "$target_opus" || "$file" -nt "$target_opus" ]]; then
+            opusenc --quiet --bitrate "$BITRATE" --vbr $NO_PICTURES_OPT "$file" "$target_opus"
+        fi
+    else
+        local target_copy="$DEST_DIR/$rel_path"
+        if [[ ! -f "$target_copy" || "$file" -nt "$target_copy" ]]; then
+            cp -p "$file" "$target_copy"
+        fi
+    fi
+}
+export -f sync_item
+
+# Get total file count and pipe to parallel
+total=$(find . -type f | wc -l)
+find . -type f -print0 | parallel -0 --total "$total" --bar -j "$JOBS" sync_item {}
